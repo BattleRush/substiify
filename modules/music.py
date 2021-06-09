@@ -5,10 +5,10 @@ from urllib.parse import urlparse
 from urllib.parse import parse_qs
 from random import shuffle
 import itertools
+import wavelink
 import logging
 import asyncio
 import discord
-import os
 
 async def userIsInBotVC(ctx):
     if not ctx.voice_client == None:
@@ -27,65 +27,35 @@ async def userIsInAnyVC(ctx):
 class Music(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.players = {}
 
-    async def cleanup(self, guild):
-        try:
-            await guild.voice_client.disconnect()
-        except AttributeError:
-            pass
+        if not hasattr(bot, 'wavelink'):
+            self.bot.wavelink = wavelink.Client(bot=self.bot)
 
-        try:
-            self.players[guild.id].stopping = True
-            del self.players[guild.id]
+        self.bot.loop.create_task(self.start_nodes())
 
-        except KeyError:
-            pass
+    async def start_nodes(self):
+        await self.bot.wait_until_ready()
 
-    def get_player(self, ctx):
-        try:
-            player = self.players[ctx.guild.id]
-        except KeyError:
-            player = MusicPlayer(ctx)
-            self.players[ctx.guild.id] = player
-        return player
-
-    def checkIfYoutubePlaylist(self, url):
-        return 'list=' in url
-
-    async def parseUrl(self, ctx, player, url):
-        if url.startswith('<'):
-            url = url[1:-1]
-        if self.checkIfYoutubePlaylist(url):
-            # return
-            parsed = urlparse(url)
-            newUrl = f'https://youtube.com/playlist?list={parse_qs(parsed.query)["list"][0]}'
-            urls = YTDLSource.get_playlist_info(newUrl)['urls']
-            await player.queue.put(YTDLSource(urls.pop(0), ctx.author))
-            await ctx.message.delete()
-            for entry in urls:
-                await player.queue.put(YTDLSource(entry, ctx.author))
-            await ctx.send(f'Queued **{len(urls)}** songs')
-        else:
-            song = YTDLSource(url, ctx.author)
-            await ctx.message.delete()
-            await player.queue.put(song)
-            await ctx.send(f"Queued **{song.data['title']}**")
-
+        await self.bot.wavelink.initiate_node(host='127.0.0.1',
+                                              port=2333,
+                                              rest_uri='http://127.0.0.1:2333',
+                                              password='youshallnotpass',
+                                              identifier='TEST',
+                                              region='us_central')
 
     @commands.command(aliases=["p"])
-    async def play(self, ctx, *, url):
-        vc = ctx.voice_client
-        play = False
-        if not vc and await userIsInAnyVC(ctx):
-            await ctx.invoke(self.connect)
-            play = True
-        elif await userIsInBotVC(ctx):
-            play = True
+    async def play(self, ctx, *, query: str):
+        tracks = await self.bot.wavelink.get_tracks(f'ytsearch:{query}')
 
-        if play:
-            player = self.get_player(ctx)
-            await self.parseUrl(ctx, player, url)
+        if not tracks:
+            return await ctx.send('Could not find any songs with that query.')
+
+        player = self.bot.wavelink.get_player(ctx.guild.id)
+        if not player.is_connected:
+            await ctx.invoke(self.connect_)
+
+        await ctx.send(f'Added {str(tracks[0])} to the queue.')
+        await player.play(tracks[0])
 
     @commands.command()
     @commands.check(userIsInBotVC)
@@ -176,29 +146,17 @@ class Music(commands.Cog):
         await ctx.message.delete()
         await ctx.send('Queue has been shuffled', delete_after=15)
 
-    @commands.command()
-    async def connect(self, ctx, *, channel: discord.VoiceChannel=None):
+    @commands.command(name='connect')
+    async def connect_(self, ctx, *, channel: discord.VoiceChannel=None):
         if not channel:
             try:
                 channel = ctx.author.voice.channel
             except AttributeError:
-                raise InvalidVoiceChannel('No channel to join. Please either specify a valid channel or join one.')
+                raise discord.DiscordException('No channel to join. Please either specify a valid channel or join one.')
 
-        botsVc = ctx.voice_client
-        if botsVc:
-            if botsVc.channel.id == channel.id:
-                return
-            try:
-                await botsVc.move_to(channel)
-            except asyncio.TimeoutError:
-                raise VoiceConnectionError(f'Moving to channel: <{channel}> timed out.')
-        else:
-            try:
-                await channel.connect()
-            except asyncio.TimeoutError:
-                raise VoiceConnectionError(f'Connecting to channel: <{channel}> timed out.')
-
-        await ctx.send(f'Connected to: **{channel}**', delete_after=30)
+        player = self.bot.wavelink.get_player(ctx.guild.id)
+        await ctx.send(f'Connecting to **`{channel.name}`**')
+        await player.connect(channel.id)
 
 def setup(bot):
     bot.add_cog(Music(bot))
